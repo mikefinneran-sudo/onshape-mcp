@@ -33,7 +33,16 @@ from .builders.revolve import RevolveBuilder, RevolveType
 from .builders.pattern import LinearPatternBuilder, CircularPatternBuilder
 from .builders.boolean import BooleanBuilder, BooleanType
 from .analysis.interference import check_assembly_interference, format_interference_result
-from .analysis.positioning import get_assembly_positions, set_absolute_position, align_to_face
+from .analysis.positioning import get_assembly_positions, set_absolute_position, align_to_face, fix_instance
+from .analysis.guards import (
+    GuardResult,
+    extract_occurrence_fixed_state,
+    validate_face_pair,
+    validate_part_face_mapping,
+    verify_positions_stable,
+    get_face_normal_from_body_details,
+)
+from .patterns.store import PatternStore, AssemblyPattern, PatternPart, PatternMate, PatternPosition
 
 # Configure loguru to output to stderr
 logger.remove()  # Remove default handler
@@ -56,6 +65,14 @@ partstudio_manager = PartStudioManager(client)
 variable_manager = VariableManager(client)
 document_manager = DocumentManager(client)
 assembly_manager = AssemblyManager(client)
+
+# Initialize pattern store (graceful degradation if unavailable)
+try:
+    pattern_store = PatternStore()
+    logger.info(f"Pattern store initialized at {pattern_store.db_path}")
+except Exception as e:
+    logger.warning(f"Pattern store unavailable: {e}")
+    pattern_store = None
 featurescript_manager = FeatureScriptManager(client)
 export_manager = ExportManager(client)
 
@@ -483,6 +500,7 @@ async def list_tools() -> list[Tool]:
                     "secondOffsetX": {"type": "number", "description": "Second connector X offset from face center in inches", "default": 0},
                     "secondOffsetY": {"type": "number", "description": "Second connector Y offset from face center in inches", "default": 0},
                     "secondOffsetZ": {"type": "number", "description": "Second connector Z offset (along face normal) in inches", "default": 0},
+                    "validate": {"type": "boolean", "description": "Run assembly guards (face direction check, Part ID validation). Set false for bulk operations.", "default": True},
                 },
                 "required": ["documentId", "workspaceId", "elementId", "firstInstanceId", "secondInstanceId", "firstFaceId", "secondFaceId"],
             },
@@ -948,6 +966,25 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="fix_instance",
+            description="Fix (ground) or unfix an assembly instance at its current position. Grounded instances cannot be moved by the solver. The first instance in an assembly should typically be grounded as the reference part.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {"type": "string", "description": "Assembly element ID"},
+                    "instanceId": {"type": "string", "description": "Instance ID to fix/unfix"},
+                    "fixed": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "True to ground the instance, False to unground it",
+                    },
+                },
+                "required": ["documentId", "workspaceId", "elementId", "instanceId"],
+            },
+        ),
+        Tool(
             name="align_instance_to_face",
             description="Position source instance flush against a face of target instance. Faces: front (min Y), back (max Y), left (min X), right (max X), bottom (min Z), top (max Z). Only moves the perpendicular axis; other axes stay unchanged.",
             inputSchema={
@@ -1010,6 +1047,54 @@ async def list_tools() -> list[Tool]:
                     "faceId": {"type": "string", "description": "Face deterministic ID (from body details)"},
                 },
                 "required": ["documentId", "workspaceId", "elementId", "instanceId", "faceId"],
+            },
+        ),
+        Tool(
+            name="capture_assembly_pattern",
+            description="Capture the current assembly as a reusable pattern. Stores part roles, dimensions, positions, and mate strategies in the pattern library for future reference. Use after completing a successful assembly.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {"type": "string", "description": "Assembly element ID"},
+                    "name": {"type": "string", "description": "Pattern name (e.g., '8-drawer cabinet')"},
+                    "description": {"type": "string", "description": "What this pattern builds and key dimensions"},
+                },
+                "required": ["documentId", "workspaceId", "elementId", "name", "description"],
+            },
+        ),
+        Tool(
+            name="search_assembly_patterns",
+            description="Search the pattern library for assembly patterns by keywords. Returns matching patterns with part counts and descriptions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keywords (e.g., 'cabinet drawer', 'bookshelf')"},
+                    "limit": {"type": "integer", "description": "Max results", "default": 10},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="get_pattern_detail",
+            description="Get full details of a stored assembly pattern including all parts, mates, and positions. Use the pattern_id from search results.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "patternId": {"type": "integer", "description": "Pattern ID from search results"},
+                },
+                "required": ["patternId"],
+            },
+        ),
+        Tool(
+            name="list_assembly_patterns",
+            description="List all stored assembly patterns, most recent first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max results", "default": 50},
+                },
             },
         ),
     ]
@@ -1128,44 +1213,61 @@ async def _create_mate(
     Returns the mate feature ID.
     """
     # Create explicit mate connector on a face of the first instance
-    mc1 = MateConnectorBuilder(
-        name=f"{mate_name} - MC1",
-        face_id=first_face_id,
-        occurrence_path=[first_instance_id],
-    )
-    if first_offset:
-        mc1.set_translation(*first_offset)
-    result1 = await assembly_manager.add_feature(
-        document_id=document_id, workspace_id=workspace_id,
-        element_id=element_id, feature_data=mc1.build(),
-    )
-    mc1_id = result1.get("feature", {}).get("featureId", "unknown")
+    mc1_id = None
+    mc2_id = None
 
-    # Create explicit mate connector on a face of the second instance
-    mc2 = MateConnectorBuilder(
-        name=f"{mate_name} - MC2",
-        face_id=second_face_id,
-        occurrence_path=[second_instance_id],
-    )
-    if second_offset:
-        mc2.set_translation(*second_offset)
-    result2 = await assembly_manager.add_feature(
-        document_id=document_id, workspace_id=workspace_id,
-        element_id=element_id, feature_data=mc2.build(),
-    )
-    mc2_id = result2.get("feature", {}).get("featureId", "unknown")
+    try:
+        mc1 = MateConnectorBuilder(
+            name=f"{mate_name} - MC1",
+            face_id=first_face_id,
+            occurrence_path=[first_instance_id],
+        )
+        if first_offset:
+            mc1.set_translation(*first_offset)
+        result1 = await assembly_manager.add_feature(
+            document_id=document_id, workspace_id=workspace_id,
+            element_id=element_id, feature_data=mc1.build(),
+        )
+        mc1_id = result1.get("feature", {}).get("featureId", "unknown")
 
-    # Create the mate referencing the explicit mate connectors
-    mate = MateBuilder(name=mate_name, mate_type=mate_type)
-    mate.set_first_connector(mc1_id)
-    mate.set_second_connector(mc2_id)
-    if min_limit is not None and max_limit is not None:
-        mate.set_limits(min_limit, max_limit)
-    result = await assembly_manager.add_feature(
-        document_id=document_id, workspace_id=workspace_id,
-        element_id=element_id, feature_data=mate.build(),
-    )
-    return result.get("feature", {}).get("featureId", "unknown")
+        # Create explicit mate connector on a face of the second instance
+        mc2 = MateConnectorBuilder(
+            name=f"{mate_name} - MC2",
+            face_id=second_face_id,
+            occurrence_path=[second_instance_id],
+        )
+        if second_offset:
+            mc2.set_translation(*second_offset)
+        result2 = await assembly_manager.add_feature(
+            document_id=document_id, workspace_id=workspace_id,
+            element_id=element_id, feature_data=mc2.build(),
+        )
+        mc2_id = result2.get("feature", {}).get("featureId", "unknown")
+
+        # Create the mate referencing the explicit mate connectors
+        mate = MateBuilder(name=mate_name, mate_type=mate_type)
+        mate.set_first_connector(mc1_id)
+        mate.set_second_connector(mc2_id)
+        if min_limit is not None and max_limit is not None:
+            mate.set_limits(min_limit, max_limit)
+        result = await assembly_manager.add_feature(
+            document_id=document_id, workspace_id=workspace_id,
+            element_id=element_id, feature_data=mate.build(),
+        )
+        return result.get("feature", {}).get("featureId", "unknown")
+
+    except Exception:
+        # Rollback: clean up any MCs that were created before the failure
+        for mc_id in [mc1_id, mc2_id]:
+            if mc_id and mc_id != "unknown":
+                try:
+                    await assembly_manager.delete_feature(
+                        document_id, workspace_id, element_id, mc_id
+                    )
+                    logger.info(f"Rolled back orphaned MC {mc_id}")
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to clean up MC {mc_id}: {cleanup_err}")
+        raise  # Re-raise the original exception
 
 
 @app.call_tool()
@@ -1977,16 +2079,84 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     elif name == "create_fastened_mate":
         try:
             mate_name = arguments.get("name", "Fastened mate")
+            doc_id = arguments["documentId"]
+            ws_id = arguments["workspaceId"]
+            elem_id = arguments["elementId"]
+            inst1_id = arguments["firstInstanceId"]
+            inst2_id = arguments["secondInstanceId"]
+            face1_id = arguments["firstFaceId"]
+            face2_id = arguments["secondFaceId"]
+            validate = arguments.get("validate", True)
+
+            guard_warnings = ""
+
+            if validate:
+                try:
+                    # Fetch assembly data for guard checks
+                    asm_data = await assembly_manager.get_assembly_definition(doc_id, ws_id, elem_id)
+                    root = asm_data.get("rootAssembly", {})
+                    instances = root.get("instances", [])
+
+                    # Resolve Part Studio element IDs for each instance
+                    inst1_ps_elem = None
+                    inst2_ps_elem = None
+                    inst1_part_id = None
+                    inst2_part_id = None
+                    for inst in instances:
+                        if inst.get("id") == inst1_id:
+                            inst1_ps_elem = inst.get("elementId")
+                            inst1_part_id = inst.get("partId")
+                        elif inst.get("id") == inst2_id:
+                            inst2_ps_elem = inst.get("elementId")
+                            inst2_part_id = inst.get("partId")
+
+                    # Get body details for face normal lookup (cache by PS element)
+                    bodies_cache = {}
+                    for ps_elem in set(filter(None, [inst1_ps_elem, inst2_ps_elem])):
+                        try:
+                            bd = await partstudio_manager.get_body_details(doc_id, ws_id, ps_elem)
+                            bodies_cache[ps_elem] = bd.get("bodies", [])
+                        except Exception as bd_err:
+                            logger.warning(f"Could not fetch body details for {ps_elem}: {bd_err}")
+
+                    # Guard: validate face belongs to correct Part ID
+                    for inst_id, ps_elem, part_id, face_id in [
+                        (inst1_id, inst1_ps_elem, inst1_part_id, face1_id),
+                        (inst2_id, inst2_ps_elem, inst2_part_id, face2_id),
+                    ]:
+                        if ps_elem and ps_elem in bodies_cache:
+                            result = validate_part_face_mapping(asm_data, inst_id, face_id, bodies_cache[ps_elem])
+                            if not result.passed:
+                                guard_warnings += result.format_warnings()
+
+                    # Guard: check face direction (anti-parallel warning)
+                    if inst1_ps_elem and inst2_ps_elem and inst1_part_id and inst2_part_id:
+                        n1 = get_face_normal_from_body_details(
+                            bodies_cache.get(inst1_ps_elem, []), inst1_part_id, face1_id
+                        )
+                        n2 = get_face_normal_from_body_details(
+                            bodies_cache.get(inst2_ps_elem, []), inst2_part_id, face2_id
+                        )
+                        if n1 and n2:
+                            fixed_states = extract_occurrence_fixed_state(asm_data)
+                            result = validate_face_pair(
+                                n1, n2,
+                                instance1_fixed=fixed_states.get(inst1_id, False),
+                                instance2_fixed=fixed_states.get(inst2_id, False),
+                            )
+                            guard_warnings += result.format_warnings()
+
+                except Exception as guard_err:
+                    logger.warning(f"Guard checks failed (non-blocking): {guard_err}")
+
             feature_id = await _create_mate(
-                assembly_manager,
-                arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
-                arguments["firstInstanceId"], arguments["secondInstanceId"],
-                arguments["firstFaceId"], arguments["secondFaceId"],
+                assembly_manager, doc_id, ws_id, elem_id,
+                inst1_id, inst2_id, face1_id, face2_id,
                 mate_name, MateType.FASTENED,
                 first_offset=_extract_offsets(arguments, "first"),
                 second_offset=_extract_offsets(arguments, "second"),
             )
-            return [TextContent(type="text", text=f"Created fastened mate '{mate_name}'. Feature ID: {feature_id}")]
+            return [TextContent(type="text", text=f"{guard_warnings}Created fastened mate '{mate_name}'. Feature ID: {feature_id}")]
         except httpx.HTTPStatusError as e:
             error_body = ""
             try:
@@ -2395,6 +2565,22 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         except Exception as e:
             return [TextContent(type="text", text=f"Error setting position: {str(e)}")]
 
+    elif name == "fix_instance":
+        try:
+            msg = await fix_instance(
+                assembly_manager=assembly_manager,
+                document_id=arguments["documentId"],
+                workspace_id=arguments["workspaceId"],
+                element_id=arguments["elementId"],
+                instance_id=arguments["instanceId"],
+                fixed=arguments.get("fixed", True),
+            )
+            return [TextContent(type="text", text=msg)]
+        except httpx.HTTPStatusError as e:
+            return [TextContent(type="text", text=f"Error fixing instance: API returned {e.response.status_code}.")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fixing instance: {str(e)}")]
+
     elif name == "align_instance_to_face":
         try:
             msg = await align_to_face(
@@ -2598,6 +2784,148 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             return [TextContent(type="text", text=f"Error querying face CS: API returned {e.response.status_code}.")]
         except Exception as e:
             return [TextContent(type="text", text=f"Error querying face CS: {str(e)}")]
+
+    elif name == "capture_assembly_pattern":
+        if not pattern_store:
+            return [TextContent(type="text", text="Pattern store unavailable. Check server logs.")]
+        try:
+            doc_id = arguments["documentId"]
+            ws_id = arguments["workspaceId"]
+            elem_id = arguments["elementId"]
+
+            # Fetch assembly data
+            asm_data = await assembly_manager.get_assembly_definition(doc_id, ws_id, elem_id)
+            root = asm_data.get("rootAssembly", {})
+            instances = root.get("instances", [])
+            from .analysis.positioning import extract_occurrence_transforms, get_position_from_transform
+            occ_transforms = extract_occurrence_transforms(asm_data)
+            identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+
+            # Find reference part (first instance) position
+            ref_pos = (0.0, 0.0, 0.0)
+            if instances:
+                ref_transform = occ_transforms.get(instances[0].get("id", ""), identity)
+                ref_pos = get_position_from_transform(ref_transform)
+
+            # Build parts list with dimensions from bounding boxes
+            parts = []
+            positions = []
+            seen_parts = {}
+            for inst in instances:
+                if inst.get("type") != "Part" or inst.get("suppressed", False):
+                    continue
+                part_id = inst.get("partId", "")
+                inst_elem = inst.get("elementId", "")
+                role = inst.get("name", "unknown").replace("<", "").replace(">", "").strip()
+
+                # Get bounding box for dimensions
+                cache_key = (doc_id, inst_elem, part_id)
+                if cache_key not in seen_parts:
+                    try:
+                        bbox_data = await partstudio_manager.get_part_bounding_box(
+                            doc_id, ws_id, inst_elem, part_id
+                        )
+                        from .analysis.interference import BoundingBox, METERS_TO_INCHES
+                        bbox = BoundingBox.from_api_response(bbox_data)
+                        w = (bbox.high_x - bbox.low_x) * METERS_TO_INCHES
+                        d = (bbox.high_y - bbox.low_y) * METERS_TO_INCHES
+                        h = (bbox.high_z - bbox.low_z) * METERS_TO_INCHES
+                        seen_parts[cache_key] = (w, d, h)
+                        parts.append(PatternPart(role=role, width=round(w, 3), depth=round(d, 3), height=round(h, 3)))
+                    except Exception:
+                        seen_parts[cache_key] = (0, 0, 0)
+
+                # Compute relative position
+                transform = occ_transforms.get(inst["id"], identity)
+                pos = get_position_from_transform(transform)
+                rel_x = (pos[0] - ref_pos[0]) * METERS_TO_INCHES
+                rel_y = (pos[1] - ref_pos[1]) * METERS_TO_INCHES
+                rel_z = (pos[2] - ref_pos[2]) * METERS_TO_INCHES
+
+                # Count instance number for this role
+                instance_num = sum(1 for p in positions if p.role == role) + 1
+                positions.append(PatternPosition(
+                    role=role, instance_number=instance_num,
+                    relative_x=round(rel_x, 3), relative_y=round(rel_y, 3), relative_z=round(rel_z, 3),
+                ))
+
+            # Count mates from features
+            features_data = await assembly_manager.get_features(doc_id, ws_id, elem_id)
+            mate_count = sum(
+                1 for f in features_data.get("features", [])
+                if f.get("btType", "").startswith("BTMMate-")
+            )
+
+            pattern = AssemblyPattern(
+                name=arguments["name"],
+                description=arguments.get("description", ""),
+                part_count=len(instances),
+                mate_count=mate_count,
+                parts=parts,
+                positions=positions,
+            )
+            pattern_id = pattern_store.store_pattern(pattern)
+            return [TextContent(type="text", text=(
+                f"Captured pattern '{arguments['name']}' (id={pattern_id}). "
+                f"{len(parts)} unique parts, {len(positions)} instances, {mate_count} mates stored."
+            ))]
+        except Exception as e:
+            logger.exception("Error capturing pattern")
+            return [TextContent(type="text", text=f"Error capturing pattern: {str(e)}")]
+
+    elif name == "search_assembly_patterns":
+        if not pattern_store:
+            return [TextContent(type="text", text="Pattern store unavailable.")]
+        try:
+            results = pattern_store.search_patterns(
+                arguments["query"], limit=arguments.get("limit", 10)
+            )
+            if not results:
+                return [TextContent(type="text", text=f"No patterns found for '{arguments['query']}'.")]
+            lines = [f"Found {len(results)} pattern(s):\n"]
+            for p in results:
+                lines.append(f"**{p.name}** (id={p.pattern_id}, {p.part_count} parts, {p.mate_count} mates)")
+                lines.append(f"  {p.description}")
+                lines.append(f"  Created: {p.created_at}\n")
+            return [TextContent(type="text", text="\n".join(lines))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error searching patterns: {str(e)}")]
+
+    elif name == "get_pattern_detail":
+        if not pattern_store:
+            return [TextContent(type="text", text="Pattern store unavailable.")]
+        try:
+            p = pattern_store.get_pattern(arguments["patternId"])
+            if not p:
+                return [TextContent(type="text", text=f"Pattern {arguments['patternId']} not found.")]
+            lines = [f"**{p.name}** (id={p.pattern_id})\n{p.description}\n"]
+            lines.append(f"Parts ({len(p.parts)}):")
+            for part in p.parts:
+                lines.append(f"  {part.role}: {part.width}\"W × {part.depth}\"D × {part.height}\"H")
+            lines.append(f"\nPositions ({len(p.positions)}):")
+            for pos in p.positions:
+                lines.append(f"  {pos.role} #{pos.instance_number}: relative ({pos.relative_x}, {pos.relative_y}, {pos.relative_z})")
+            if p.mates:
+                lines.append(f"\nMates ({len(p.mates)}):")
+                for m in p.mates:
+                    lines.append(f"  {m.role_first} → {m.role_second}: {m.mate_type} ({m.direction} direction, {m.first_face_label}/{m.second_face_label})")
+            return [TextContent(type="text", text="\n".join(lines))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error getting pattern: {str(e)}")]
+
+    elif name == "list_assembly_patterns":
+        if not pattern_store:
+            return [TextContent(type="text", text="Pattern store unavailable.")]
+        try:
+            results = pattern_store.list_patterns(limit=arguments.get("limit", 50))
+            if not results:
+                return [TextContent(type="text", text="No patterns stored yet. Use capture_assembly_pattern after building an assembly.")]
+            lines = [f"Stored patterns ({len(results)}):\n"]
+            for p in results:
+                lines.append(f"  [{p.pattern_id}] {p.name} — {p.part_count} parts, {p.mate_count} mates ({p.created_at})")
+            return [TextContent(type="text", text="\n".join(lines))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error listing patterns: {str(e)}")]
 
     else:
         raise ValueError(f"Unknown tool: {name}")
