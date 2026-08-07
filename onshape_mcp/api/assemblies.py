@@ -123,6 +123,7 @@ class AssemblyManager:
         element_id: str,
         occurrences: List[Dict[str, Any]],
         is_relative: bool = True,
+        is_fixed: bool | None = None,
     ) -> Dict[str, Any]:
         """Apply transforms to assembly occurrences.
 
@@ -134,6 +135,8 @@ class AssemblyManager:
                 (list of instance IDs) and "transform" (16-element 4x4 matrix)
             is_relative: If True (default), transform is applied relative to
                 current position. If False, transform sets absolute position.
+            is_fixed: If True, fix (ground) the instances. If False, unfix them.
+                If None (default), don't change the fixed state.
 
         Returns:
             API response
@@ -147,6 +150,8 @@ class AssemblyManager:
             "occurrences": [{"path": occ["path"]} for occ in occurrences],
             "transform": occurrences[0]["transform"],
         }
+        if is_fixed is not None:
+            data["isFixed"] = is_fixed
         return await self.client.post(path, data=data)
 
     async def add_feature(

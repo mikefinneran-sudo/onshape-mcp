@@ -213,7 +213,28 @@ In the Onshape UI:
 3. Verify the drawer slides forward (out of the cabinet)
 4. If it slides backward, swap the instance order in the slider mate
 
+## Alternative: Position-Based Assembly (No Mates)
+
+For cabinets with no sliding drawers (fixed shelves only), position-based assembly is simpler and more reliable. The 8-Drawer Cabinet (45 instances) was built entirely with `set_instance_position` — zero mates, zero solver issues.
+
+**Steps:**
+1. Create all Part Studios (one part per PS to avoid geometry merge)
+2. Add all instances to the assembly
+3. Ground the back panel
+4. Calculate absolute positions from part dimensions (account for Front plane -Y extrude direction)
+5. Place every instance with `set_instance_position`
+6. Verify with `check_assembly_interference` (should be 0 overlaps)
+
+**When to use position-based**: Static furniture (bookshelves, tables, spice racks, fixed-shelf cabinets).
+**When to use mates**: Assemblies with motion (sliding drawers, hinged doors, rotating joints).
+
 ## Gotchas and Lessons Learned
+
+### 0. One Part Per Part Studio
+Parts with similar dimensions in the same PS can merge into one body. The cabinet's back panel (24×0.75×30) and door (24×0.75×30) fused together when in the same PS. **Fix**: Always use separate Part Studios for each unique part shape.
+
+### 0b. Front Plane Extrudes Go -Y
+Extrusions from the Front plane go in -Y by default. A 4" deep shelf extruded on Front plane spans Y=[0, -4], not Y=[0, 4]. Account for this when computing instance Y positions.
 
 ### 1. MC Order Determines Slide Direction
 The order of instances in `create_slider_mate` determines which direction is "positive." For drawers, put the **drawer first** (moving part) and **cabinet second** (fixed reference) so positive = outward.
@@ -238,3 +259,12 @@ If you click "Solve" or add limits, the solver may find a valid but wrong config
 
 ### 8. Anti-Parallel Faces Flip Free-Floating Parts
 Using face-to-face contact surfaces (opposite normals) for fastened mates between two free-floating parts causes the solver to rotate one part 180° to align the MC coordinate frames. A drawer left panel at Y=[-16, -2] can flip to Y=[-30, -16]. **Fix**: Use same-direction faces (same outward normal on both parts) with `offsetZ` to bridge the gap. Anti-parallel is only safe when one part is grounded.
+
+### 9. Moving Mated Parts Cascades Through Solver
+Moving a mated door cascaded through the solver and shifted the entire cabinet, even with a grounded back panel. **Fix**: Delete mates BEFORE repositioning mated instances, then recreate.
+
+### 10. Deleting Mates Leaves Orphan MCs
+Mates are 3 features (MC1 + MC2 + mate). Deleting just the mate leaves MCs behind. Delete all 3 features for clean removal. The guards module handles this automatically on mate creation failure.
+
+### 11. Face IDs Belong to Part IDs, Not Instance Names
+Face IDs (e.g., JHW) map to Part IDs (e.g., JHD), not to instance names. When a PS has multiple parts, you must check `get_assembly` to see which Part ID each instance uses before selecting faces from `get_body_details`. In the cabinet, Part 1 (JHD = back panel) and Part 4 (JQD = door) looked identical in size — the only way to tell them apart was the Part ID → face prefix mapping.

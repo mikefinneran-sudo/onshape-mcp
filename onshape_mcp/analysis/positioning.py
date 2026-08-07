@@ -268,6 +268,44 @@ async def get_assembly_positions(
     return format_positions_report(positions)
 
 
+async def fix_instance(
+    assembly_manager,
+    document_id: str,
+    workspace_id: str,
+    element_id: str,
+    instance_id: str,
+    fixed: bool = True,
+) -> str:
+    """Fix (ground) or unfix an assembly instance at its current position.
+
+    Args:
+        assembly_manager: AssemblyManager instance
+        document_id: Document ID
+        workspace_id: Workspace ID
+        element_id: Assembly element ID
+        instance_id: Instance to fix/unfix
+        fixed: True to ground the instance, False to unground it
+
+    Returns:
+        Confirmation message string
+    """
+    # Get current transform so we don't move the instance
+    assembly_data = await assembly_manager.get_assembly_definition(
+        document_id, workspace_id, element_id
+    )
+    occ_transforms = extract_occurrence_transforms(assembly_data)
+    identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    current_transform = occ_transforms.get(instance_id, identity)
+
+    occurrences = [{"path": [instance_id], "transform": current_transform}]
+    await assembly_manager.transform_occurrences(
+        document_id, workspace_id, element_id, occurrences,
+        is_relative=False, is_fixed=fixed,
+    )
+    action = "Fixed (grounded)" if fixed else "Unfixed (ungrounded)"
+    return f"{action} instance {instance_id}"
+
+
 async def set_absolute_position(
     assembly_manager,
     document_id: str,

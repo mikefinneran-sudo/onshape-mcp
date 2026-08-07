@@ -1,10 +1,18 @@
 # Onshape MCP Server
 
+## Tech Stack
+- **Language**: Python 3.11+
+- **Framework**: MCP SDK
+- **API**: Onshape REST API
+- **Testing**: pytest
+- **Linting**: ruff
+
 ## Project Conventions
 
 - **PRs target `develop`**, never `main`. `main` is only for releases.
 - Tests: `pytest` (all tests must pass). Coverage: `pytest --cov`.
 - Style: `ruff check` and `ruff format --check`.
+- **Don't create files > 500 lines.**
 
 ## Assembly Workflow (5-Step Methodology)
 

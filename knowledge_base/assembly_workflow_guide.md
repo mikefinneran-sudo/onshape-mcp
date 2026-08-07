@@ -2,6 +2,35 @@
 
 Methodology for building Onshape assemblies using the MCP server tools. Derived from real-world testing on multi-part assemblies (cabinets, drawers with slider mates).
 
+## Part Studio Rules
+
+### One Part Per Part Studio (CRITICAL)
+
+Parts with identical or similar dimensions in the same Part Studio can **merge into a single body**. Onshape's default behavior joins overlapping sketches/extrusions.
+
+**Example**: A 24"×0.75"×30" back panel and a 24"×0.75"×30" door in the same PS may fuse into one part. The door disappears from the parts list.
+
+**Rule**: Always create separate Part Studios for parts with the same cross-section or dimensions. Even if they look different in the assembly, Onshape sees overlapping geometry in the PS.
+
+### Front Plane Extrude Direction
+
+Extrusions from the Front plane go in the **-Y direction** by default. A sketch at (0,0) with a 4" extrude produces a body spanning Y=[0, -4], not Y=[0, 4].
+
+**Impact on positioning**: If a part is sketched at origin and extruded 4" on the Front plane, placing the instance at Y=0 means the part body occupies Y=[0, -4] in world space. Account for this when computing positions — you may need to offset by the extrude depth.
+
+### PS Offset Matters for Positioning
+
+Parts sketched at non-origin locations in their Part Studio carry that offset into the assembly. A shelf sketched at X=25 in PS needs `instance_pos_X = target_X - 25` to land at the right position.
+
+**Best practice**: Sketch all parts at the PS origin (0,0) to eliminate offset math. If you inherit a PS with offset geometry, measure it via `get_bounding_box` and subtract.
+
+### Default Camera Orientation
+
+Onshape's default camera looks in the **+Y direction** (toward Y=0). Orient assemblies so the "front" (visible face) points toward Y=0 or has low Y values. This means:
+- Back panels at high Y values (or Y=0 if thin)
+- Drawer fronts / shelf fronts at low Y values
+- For cabinets: front faces the camera, back is away
+
 ## Assembly Planning
 
 ### 1. Understand the Design
@@ -10,7 +39,8 @@ Before calling any tools, plan the assembly:
 
 - **Identify all parts** and which Part Studios they come from
 - **Choose a reference part** — typically the largest or most central part (e.g., a back panel, base plate)
-- **Plan the mate order** — work inside-out from the reference part
+- **Decide the assembly approach** — position-based (simpler) or mate-based (constrained)
+- **Plan the mate order** (if using mates) — work inside-out from the reference part
 - **Identify mate types** — fastened for rigid connections, slider/revolute/cylindrical for motion
 
 ### 2. Ground a Reference Part
@@ -33,6 +63,30 @@ Don't create all mates at once. Work in batches and verify between each:
 5. Move to the next group (e.g., drawers, moving parts)
 6. Create motion mates (slider, revolute)
 7. Verify final positions
+
+## Assembly Approaches
+
+### Position-Based Assembly (Recommended for Static Furniture)
+
+For assemblies with no moving parts (bookshelves, tables, cabinets without sliding drawers), skip mates entirely and use `set_instance_position` to place every part:
+
+1. Ground one reference part (back panel, base, or first leg)
+2. Calculate absolute positions for every instance based on part dimensions
+3. Place each instance with `set_instance_position`
+4. Verify with `get_assembly_positions` and `check_assembly_interference`
+
+**Advantages**: No solver surprises, no anti-parallel flipping, no cascade drift. Deterministic.
+**Limitation**: Parts have no constraints — they won't move together if the reference moves. Fine for static designs.
+
+**Proven on**: 8-drawer cabinet (45 instances), bookshelf (8 instances), side table (10 instances), spice rack (11 instances) — all zero interference.
+
+### Mate-Based Assembly (Required for Motion)
+
+Use mates when parts need to move relative to each other (drawer sliders, hinged doors, revolute joints). Follow the same-direction face technique and batch verification workflow below.
+
+### Hybrid Approach
+
+Ground and position the rigid frame, then add mates only where motion is needed. The cabinet frame test used this: 6 instances positioned + 5 fastened mates for the frame, then drawers could have slider mates added later.
 
 ## Positioning Parts
 
@@ -221,6 +275,20 @@ get_assembly_features → for each feature:
   - "SUPPRESSED" = intentionally disabled
 ```
 
+## Solver Cascade and Cleanup
+
+### Moving Mated Parts Cascades Through the Solver
+
+Moving a part that has mates attached triggers the solver to recompute ALL connected constraints. Even if the reference part is grounded, other mated parts may shift to satisfy the changed constraint graph.
+
+**Rule**: Delete mates BEFORE repositioning mated instances. Reposition the part, then recreate the mates. Never move a mated part and hope the solver cooperates.
+
+### Deleting a Mate Does NOT Delete Its Mate Connectors
+
+Mates are composed of 3 features: MC1 + MC2 + the mate itself. Deleting the mate feature leaves the two MCs as orphans in the assembly feature list. These orphaned MCs are harmless but clutter the feature list.
+
+**Cleanup**: After deleting a mate, also delete the two associated MCs via `delete_feature`. The guards module's `_create_mate` method handles MC rollback automatically on mate creation failure.
+
 ## Common Mistakes
 
 ### 1. Forgetting Reference Part Offset
@@ -262,3 +330,31 @@ Picking face-to-face contact surfaces (opposite normals) for fastened mates betw
 | Move part (absolute) | `set_instance_position` | Resets rotation; fails on fixed parts |
 | Align to face | `align_instance_to_face` | Moves one axis only |
 | Interference check | `check_assembly_interference` | Bounding-box based overlap detection |
+| Capture pattern | `capture_assembly_pattern` | Save assembly as reusable template |
+| Search patterns | `search_assembly_patterns` | FTS5 search across pattern library |
+| Pattern detail | `get_pattern_detail` | Full parts/mates/positions for a pattern |
+| List patterns | `list_assembly_patterns` | Show all stored patterns |
+
+## Guards Module
+
+The `analysis/guards.py` module provides 6 validation functions that catch common assembly mistakes before they happen:
+
+| Guard | What It Catches |
+|-------|-----------------|
+| `validate_face_pair` | Anti-parallel face selection (with grounded-state awareness) |
+| `validate_part_face_mapping` | Wrong face ID on wrong Part ID |
+| `verify_positions_stable` | Solver cascade drift after mate creation |
+| `extract_occurrence_fixed_state` | Reads grounded/fixed status from occurrence data |
+| `get_face_normal_from_body_details` | Resolves face ID to normal vector |
+| `check_ps_part_count` | Warns when Part Studio has merged geometry |
+
+Guards are wired into `create_fastened_mate` via the `validate` parameter (default: true). The `_create_mate` method also handles MC rollback — if mate creation fails, orphaned MCs are automatically deleted.
+
+## Pattern Library
+
+Assembly patterns are stored in SQLite + FTS5 at `~/.onshape-mcp/patterns.db`. Each pattern captures:
+- **Parts**: Role, dimensions, Part Studio source
+- **Positions**: Instance positions in the assembly
+- **Mates**: Mate type, face IDs, offsets, instance pairs
+
+Use `capture_assembly_pattern` after completing a successful assembly. Use `search_assembly_patterns` to find similar designs when starting a new build.
