@@ -95,9 +95,14 @@ class TestVariableManager:
     ):
         """Test handling variables with missing optional fields."""
         variables_data = [
-            {"name": "var1", "expression": "1 in"},
-            {"expression": "2 in"},  # Missing name
-            {"name": "var2"},  # Missing expression
+            {
+                "variableStudioReference": None,
+                "variables": [
+                    {"name": "var1", "expression": "1 in"},
+                    {"expression": "2 in"},  # Missing name
+                    {"name": "var2"},  # Missing expression
+                ],
+            }
         ]
 
         onshape_client.get = AsyncMock(return_value=variables_data)
@@ -114,10 +119,32 @@ class TestVariableManager:
         assert result[2].expression == ""
 
     @pytest.mark.asyncio
+    async def test_get_variables_on_a_part_studio_is_empty(
+        self, variable_manager, onshape_client, sample_document_ids
+    ):
+        """A Part Studio defines no variables; the block comes back empty.
+
+        The old parser read a name off this wrapper and returned one blank
+        row, which read as "a variable exists and has no name".
+        """
+        onshape_client.get = AsyncMock(
+            return_value=[{"variableStudioReference": None, "variables": []}]
+        )
+
+        result = await variable_manager.get_variables(
+            sample_document_ids["document_id"],
+            sample_document_ids["workspace_id"],
+            sample_document_ids["element_id"],
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
     async def test_set_variable_with_description(
         self, variable_manager, onshape_client, sample_document_ids
     ):
         """Test setting a variable with description."""
+        onshape_client.get = AsyncMock(return_value=[])
         onshape_client.post = AsyncMock(return_value={"success": True})
 
         result = await variable_manager.set_variable(
@@ -138,12 +165,14 @@ class TestVariableManager:
         assert data[0]["name"] == "thickness"
         assert data[0]["expression"] == "0.25 in"
         assert data[0]["description"] == "Material thickness"
+        assert data[0]["type"] == "LENGTH"
 
     @pytest.mark.asyncio
     async def test_set_variable_without_description(
         self, variable_manager, onshape_client, sample_document_ids
     ):
         """Test setting a variable without description."""
+        onshape_client.get = AsyncMock(return_value=[])
         onshape_client.post = AsyncMock(return_value={"success": True})
 
         await variable_manager.set_variable(
@@ -164,9 +193,14 @@ class TestVariableManager:
 
     @pytest.mark.asyncio
     async def test_set_variable_updates_existing(
-        self, variable_manager, onshape_client, sample_document_ids
+        self, variable_manager, onshape_client, sample_document_ids, sample_variables
     ):
-        """Test updating an existing variable."""
+        """Updating one variable must not drop the others.
+
+        Onshape replaces the whole table on write, so a write that sends only
+        the changed variable deletes the rest.
+        """
+        onshape_client.get = AsyncMock(return_value=sample_variables)
         onshape_client.post = AsyncMock(return_value={"updated": True})
 
         result = await variable_manager.set_variable(
@@ -179,6 +213,11 @@ class TestVariableManager:
         )
 
         assert result == {"updated": True}
+
+        sent = onshape_client.post.call_args[1]["data"]
+        by_name = {v["name"]: v for v in sent}
+        assert by_name["width"]["expression"] == "15 in"
+        assert by_name["height"]["expression"] == "5 in", "existing variable dropped"
 
     @pytest.mark.asyncio
     async def test_get_configuration_definition_success(

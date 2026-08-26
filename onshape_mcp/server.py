@@ -193,26 +193,51 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_variables",
-            description="Get all variables from a Part Studio variable table",
+            description=(
+                "Get the variables an element defines. Variables live in a "
+                "Variable Studio element, not in a Part Studio: pass a Part "
+                "Studio id and the list comes back empty"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "documentId": {"type": "string", "description": "Document ID"},
                     "workspaceId": {"type": "string", "description": "Workspace ID"},
-                    "elementId": {"type": "string", "description": "Part Studio element ID"},
+                    "elementId": {"type": "string", "description": "Variable Studio element ID"},
                 },
                 "required": ["documentId", "workspaceId", "elementId"],
             },
         ),
         Tool(
-            name="set_variable",
-            description="Set or update a variable in a Part Studio variable table",
+            name="create_variable_studio",
+            description=(
+                "Create a Variable Studio element. A document needs one before "
+                "any variable can be set, and a Part Studio needs a reference "
+                "to it before any feature can use those variables"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "documentId": {"type": "string", "description": "Document ID"},
                     "workspaceId": {"type": "string", "description": "Workspace ID"},
-                    "elementId": {"type": "string", "description": "Part Studio element ID"},
+                    "name": {"type": "string", "description": "Name for the new Variable Studio"},
+                },
+                "required": ["documentId", "workspaceId", "name"],
+            },
+        ),
+        Tool(
+            name="set_variable",
+            description=(
+                "Set or update a variable in a Variable Studio. Writing to a "
+                "Part Studio element id returns 404 - variables cannot live "
+                "there. Existing variables are merged, not replaced"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {"type": "string", "description": "Variable Studio element ID"},
                     "name": {"type": "string", "description": "Variable name"},
                     "expression": {
                         "type": "string",
@@ -222,8 +247,52 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional variable description",
                     },
+                    "type": {
+                        "type": "string",
+                        "description": "Variable type: LENGTH, ANGLE, NUMBER or ANY",
+                        "enum": ["LENGTH", "ANGLE", "NUMBER", "ANY"],
+                    },
                 },
                 "required": ["documentId", "workspaceId", "elementId", "name", "expression"],
+            },
+        ),
+        Tool(
+            name="add_variable_studio_reference",
+            description=(
+                "Let a Part Studio read a Variable Studio, so its features can "
+                "name those variables. Without this the variables exist but no "
+                "sketch or extrude can use them"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {"type": "string", "description": "Part Studio element ID"},
+                    "variableStudioId": {
+                        "type": "string",
+                        "description": "Variable Studio element ID to reference",
+                    },
+                    "variableNames": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional subset of variables to expose; all by default",
+                    },
+                },
+                "required": ["documentId", "workspaceId", "elementId", "variableStudioId"],
+            },
+        ),
+        Tool(
+            name="get_variable_studio_references",
+            description="List the Variable Studios a Part Studio can read",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {"type": "string", "description": "Part Studio element ID"},
+                },
+                "required": ["documentId", "workspaceId", "elementId"],
             },
         ),
         Tool(
@@ -1505,6 +1574,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 arguments["name"],
                 arguments["expression"],
                 arguments.get("description"),
+                arguments.get("type", "LENGTH"),
             )
 
             return [
@@ -1520,7 +1590,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             return [
                 TextContent(
                     type="text",
-                    text=f"Error setting variable: API returned {e.response.status_code}. Check the variable expression format (e.g., '0.75 in').",
+                    text=(
+                        f"Error setting variable: API returned {e.response.status_code}. "
+                        "A 404 here almost always means elementId is a Part Studio: "
+                        "variables live in a Variable Studio element. Create one with "
+                        "create_variable_studio, write to that, then point the Part "
+                        "Studio at it with add_variable_studio_reference. Otherwise "
+                        "check the expression format (e.g., '0.75 in')."
+                    ),
                 )
             ]
         except Exception as e:
@@ -1530,6 +1607,110 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     type="text",
                     text=f"Error setting variable: {str(e)}",
                 )
+            ]
+
+    elif name == "create_variable_studio":
+        try:
+            result = await variable_manager.create_variable_studio(
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["name"],
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Created Variable Studio '{arguments['name']}' "
+                        f"(elementId {result.get('id', '?')}). Point a Part Studio at "
+                        "it with add_variable_studio_reference before using its "
+                        "variables in features."
+                    ),
+                )
+            ]
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"API error creating variable studio: {e.response.status_code} - {e.response.text[:500]}"
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error creating variable studio: API returned {e.response.status_code}.",
+                )
+            ]
+        except Exception as e:
+            logger.exception("Unexpected error creating variable studio")
+            return [TextContent(type="text", text=f"Error creating variable studio: {str(e)}")]
+
+    elif name == "add_variable_studio_reference":
+        try:
+            refs = await variable_manager.add_variable_studio_reference(
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+                arguments["variableStudioId"],
+                arguments.get("variableNames"),
+            )
+            listed = ", ".join(
+                r.element_id + ("" if r.entire_studio else f" ({', '.join(r.variable_names)})")
+                for r in refs
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Part Studio now reads: {listed or 'nothing'}",
+                )
+            ]
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"API error adding variable studio reference: {e.response.status_code} - {e.response.text[:500]}"
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error adding variable studio reference: API returned {e.response.status_code}.",
+                )
+            ]
+        except Exception as e:
+            logger.exception("Unexpected error adding variable studio reference")
+            return [
+                TextContent(type="text", text=f"Error adding variable studio reference: {str(e)}")
+            ]
+
+    elif name == "get_variable_studio_references":
+        try:
+            refs = await variable_manager.get_variable_studio_references(
+                arguments["documentId"], arguments["workspaceId"], arguments["elementId"]
+            )
+            if not refs:
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            "This Part Studio references no Variable Studio, so no "
+                            "feature in it can use a variable."
+                        ),
+                    )
+                ]
+            listed = "\n".join(
+                f"- {r.element_id}: "
+                + ("all variables" if r.entire_studio else ", ".join(r.variable_names))
+                for r in refs
+            )
+            return [TextContent(type="text", text=f"Variable Studios in scope:\n{listed}")]
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"API error getting variable studio references: {e.response.status_code} - {e.response.text[:500]}"
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error getting variable studio references: API returned {e.response.status_code}.",
+                )
+            ]
+        except Exception as e:
+            logger.exception("Unexpected error getting variable studio references")
+            return [
+                TextContent(type="text", text=f"Error getting variable studio references: {str(e)}")
             ]
 
     elif name == "get_features":

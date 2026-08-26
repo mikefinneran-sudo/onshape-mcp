@@ -66,6 +66,7 @@ markers = [
     "unit: marks tests as unit tests",
     "integration: marks tests as integration tests",
     "slow: marks tests as slow running",
+    "live: marks tests that call the real Onshape API (needs credentials)",
 ]
 
 [tool.coverage.run]

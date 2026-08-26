@@ -65,8 +65,20 @@ def sample_feature_response():
 
 @pytest.fixture
 def sample_variables():
-    """Provide sample variable data."""
+    """Provide sample variable data.
+
+    This is the shape the live API returns, captured from
+    GET /api/v10/variables/d/{d}/w/{w}/e/{e}/variables: a list of variable
+    studio blocks, each holding its own variables - not a flat list.
+    """
     return [
-        {"name": "width", "expression": "10 in", "description": "Width of the part"},
-        {"name": "height", "expression": "5 in", "description": "Height of the part"},
+        {
+            "variableStudioReference": None,
+            "variables": [
+                {"type": "LENGTH", "name": "width", "value": None,
+                 "expression": "10 in", "description": "Width of the part"},
+                {"type": "LENGTH", "name": "height", "value": None,
+                 "expression": "5 in", "description": "Height of the part"},
+            ],
+        }
     ]
