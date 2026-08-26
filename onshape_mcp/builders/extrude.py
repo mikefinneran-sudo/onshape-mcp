@@ -36,6 +36,7 @@ class ExtrudeBuilder:
         self.depth = depth
         self.operation_type = operation_type
         self.depth_variable: Optional[str] = None
+        self.opposite_direction = False
 
     def set_depth(self, depth: float, variable_name: Optional[str] = None) -> "ExtrudeBuilder":
         """Set extrude depth.
@@ -49,6 +50,24 @@ class ExtrudeBuilder:
         """
         self.depth = depth
         self.depth_variable = variable_name
+        return self
+
+    def set_opposite_direction(self, opposite: bool = True) -> "ExtrudeBuilder":
+        """Extrude the other way off the sketch plane.
+
+        A sketch drawn on a base plane extrudes along that plane's normal. When
+        the material to add or remove sits on the far side - a hole cut into a
+        body that lies behind the Front plane, say - the extrude has to be
+        flipped or it goes off into empty space and Onshape reports INFO
+        without failing.
+
+        Args:
+            opposite: True to extrude against the plane normal
+
+        Returns:
+            Self for chaining
+        """
+        self.opposite_direction = opposite
         return self
 
     def set_sketch(self, sketch_feature_id: str) -> "ExtrudeBuilder":
@@ -97,7 +116,6 @@ class ExtrudeBuilder:
                         ],
                         "parameterId": "entities",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                     {
                         "btType": "BTMParameterEnum-145",
@@ -106,7 +124,6 @@ class ExtrudeBuilder:
                         "value": self.operation_type.value,
                         "parameterId": "operationType",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                     {
                         "btType": "BTMParameterQuantity-147",
@@ -116,14 +133,12 @@ class ExtrudeBuilder:
                         "expression": depth_expression,
                         "parameterId": "depth",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                     {
                         "btType": "BTMParameterBoolean-144",
-                        "value": False,
+                        "value": self.opposite_direction,
                         "parameterId": "oppositeDirection",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                 ],
             },
